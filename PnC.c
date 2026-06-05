@@ -5,6 +5,8 @@
 #include "cbv2g/din/din_msgDefDecoder.h"
 #include "cbv2g/din/din_msgDefEncoder.h"
 #include "cbv2g/exi_v2gtp.h"
+#include "cbv2g/common/exi_basetypes.h"
+#include "cbv2g/common/exi_error_codes.h"
 #include "Iso15118_2.h"
 #include "ChrgM.h"
 #include "ChrgM_Helper.hpp"
@@ -44,6 +46,11 @@ extern "C"
 #ifdef VF_USE_NX_SECURE
 #define IS_SECURE (1)
 extern PnC_Helper_t gPnCHelper;
+/* These NetX crypto methods currently use the configured software crypto backend.
+ * They are the main replacement points for a hardware crypto driver/HSM:
+ * - ECDH P-256 shared-secret calculation
+ * - AES-128-CBC contract private-key decryption
+ */
 extern NX_CRYPTO_METHOD crypto_method_ecdh;
 extern NX_CRYPTO_METHOD crypto_method_aes_cbc_128;
 #else
@@ -60,6 +67,11 @@ ChrgM_InputType ChrgM_Input;
 ChrgM_OutputType ChrgM_Output;
  
 #define V2G_UDP_SERVER_PORT (15118)
+
+static boolean _isTlsConnection(void)
+{
+    return (ChrgM_Status.seccSecurity == 0x00);
+}
  
 #define DEF_INIT_MSG(msg)                                                                                       \
     void init_##msg(struct iso2_##msg *doc) { init_iso2_##msg(doc); } \
@@ -112,7 +124,7 @@ static void handleError(ChrgM_ErrorHandlerType error)
 {
     ChrgM_Status.error = error;
     ChrgM_Status.state = ChrgM_Idle;
-    SoAd_CloseSoCon(ChrgM_Status.seccSecurity == 0x00 ? SoAdConf_Tls : SoAdConf_Tcp, false);
+    SoAd_CloseSoCon(_isTlsConnection() ? SoAdConf_Tls : SoAdConf_Tcp, false);
     if ((V2G_EVCC_MsgTimeout == error) || (V2G_EVCC_CommunicationSetupTimeout == error)) {
         ChrgM_Output.retryTrigger = 1;
     }
@@ -222,7 +234,7 @@ static ChrgM_ResponseCodeType ChrgM_handleSdp(uint8* buffer, uint32_t size)
         ChrgM_Status.seccIp[i/4] <<= 8;
         ChrgM_Status.seccIp[i/4] += data[i];
     }
-    ChrgM_Status.seccPort = ((uint16)data[SDP_SECC_PORT_OFFSET] << 😎
+    ChrgM_Status.seccPort = ((uint16)data[SDP_SECC_PORT_OFFSET] << 8)
         + data[SDP_SECC_PORT_OFFSET + 1];
     ChrgM_Status.seccSecurity = data[SDP_SECC_SECURITY_OFFSET];
  
@@ -236,8 +248,8 @@ static ChrgM_ResponseCodeType ChrgM_handleSdp(uint8* buffer, uint32_t size)
         for (int i = 0; i < 4; i++) {
             addr.addr[i] = ChrgM_Status.seccIp[i];
         }
-        SoAd_SetRemoteAddr(ChrgM_Status.seccSecurity == 0x00 ? SoAdConf_Tls : SoAdConf_Tcp, (const TcpIp_SockAddrType *)&addr);
-        SoAd_OpenSoCon(ChrgM_Status.seccSecurity == 0x00 ? SoAdConf_Tls : SoAdConf_Tcp);
+        SoAd_SetRemoteAddr(_isTlsConnection() ? SoAdConf_Tls : SoAdConf_Tcp, (const TcpIp_SockAddrType *)&addr);
+        SoAd_OpenSoCon(_isTlsConnection() ? SoAdConf_Tls : SoAdConf_Tcp);
     }
     return Ok;
 }
@@ -284,6 +296,10 @@ static void prepareExi(T *doc)
 /* ========================================================================= */
 static ChrgM_ErrorHandlerType handleCheckCertificate(void)
 {
+    /* X.509 expiration check is mostly ASN.1/time metadata handling.
+     * Keep it in software unless the platform exposes a certificate validation service.
+     * Hardware crypto is more useful for ECDSA verify/sign, ECDH, SHA-256 and AES below.
+     */
     uint8_t date_time[6] = {0};
     UINT status;
     UCHAR asn1_time[14];
@@ -310,7 +326,8 @@ static ChrgM_ErrorHandlerType handleCheckCertificate(void)
         return CHRGM_FAILED;
     }
     if((gPnCHelper.contract[0].contract_cert.cert.nx_secure_x509_certificate_data == NULL) || 
-            (gPnCHelper.contract[0].contract_cert.cert.nx_secure_x509_private_key.ec_private_key.nx_secure_ec_private_key == NULL)) {
+            (gPnCHelper.contract[0].contract_cert.cert.nx_secure_x509_private_key.ec_private_key.nx_secure_ec_private_key == NULL) ||
+            (ChrgM_Status.eMAIDLen == 0)) {
         return CHRGM_NoCertificateAvailable;
     }
     if((_nx_secure_x509_expiration_check(&gPnCHelper.contract[0].contract_cert.cert, unix_time) == NX_SECURE_X509_CERTIFICATE_EXPIRED)) {
@@ -333,7 +350,7 @@ static void transmitV2gTcp(exi_bitstream_t *stream)
         .SduLength = len + V2GTP_HEADER_LENGTH
     };
     V2GTP_WriteHeader(stream->data, len);
-    SoAd_IfTransmit(ChrgM_Status.seccSecurity == 0x00 ? SoAdConf_Tls : SoAdConf_Tcp, &pdu);
+    SoAd_IfTransmit(_isTlsConnection() ? SoAdConf_Tls : SoAdConf_Tcp, &pdu);
 }
  
 /* ========================================================================= */
@@ -447,6 +464,134 @@ static void sendSessionSetupReq(T *doc)
 #ifdef VF_USE_NX_SECURE
  
 /* ========================================================================= */
+static boolean copyBoundedBytes(uint8_t *dst, uint16_t dst_size, const uint8_t *src, ULONG src_len)
+{
+    if ((src == NULL) || (src_len == 0) || (src_len > dst_size)) {
+        return FALSE;
+    }
+
+    memcpy(dst, src, src_len);
+    return TRUE;
+}
+
+static boolean copyBoundedString(char *dst, uint16_t dst_size, const char *src, uint16_t src_len)
+{
+    if ((src == NULL) || (src_len == 0) || (src_len >= dst_size)) {
+        return FALSE;
+    }
+
+    memcpy(dst, src, src_len);
+    return TRUE;
+}
+
+static boolean appendDnComponent(char *dst, uint16_t dst_size, uint16_t *offset,
+                                const char *prefix, const UCHAR *value, uint16_t value_len)
+{
+    if ((value == NULL) || (value_len == 0)) {
+        return TRUE;
+    }
+
+    uint16_t prefix_len = (uint16_t)strlen(prefix);
+    uint16_t sep_len = (*offset == 0) ? 0 : 1;
+    if ((*offset + sep_len + prefix_len + value_len) >= dst_size) {
+        return FALSE;
+    }
+
+    if (sep_len != 0) {
+        dst[*offset] = ',';
+        (*offset)++;
+    }
+    memcpy(&dst[*offset], prefix, prefix_len);
+    *offset += prefix_len;
+    memcpy(&dst[*offset], value, value_len);
+    *offset += value_len;
+    return TRUE;
+}
+
+static boolean fillRootCertificateId(struct iso2_X509IssuerSerialType *certId,
+                                     const NX_SECURE_X509_CERT *cert)
+{
+    const UCHAR *serial = cert->nx_secure_x509_issuer.nx_secure_x509_serial_number;
+    uint16_t serial_len = cert->nx_secure_x509_issuer.nx_secure_x509_serial_number_length;
+    uint16_t issuer_len = 0;
+
+    init_iso2_X509IssuerSerialType(certId);
+
+    if (!appendDnComponent(certId->X509IssuerName.characters, iso2_X509IssuerName_CHARACTER_SIZE,
+                           &issuer_len, "C=",
+                           cert->nx_secure_x509_issuer.nx_secure_x509_country,
+                           cert->nx_secure_x509_issuer.nx_secure_x509_country_length)) {
+        return FALSE;
+    }
+    if (!appendDnComponent(certId->X509IssuerName.characters, iso2_X509IssuerName_CHARACTER_SIZE,
+                           &issuer_len, "O=",
+                           cert->nx_secure_x509_issuer.nx_secure_x509_organization,
+                           cert->nx_secure_x509_issuer.nx_secure_x509_organization_length)) {
+        return FALSE;
+    }
+    if (!appendDnComponent(certId->X509IssuerName.characters, iso2_X509IssuerName_CHARACTER_SIZE,
+                           &issuer_len, "CN=",
+                           cert->nx_secure_x509_issuer.nx_secure_x509_common_name,
+                           cert->nx_secure_x509_issuer.nx_secure_x509_common_name_length)) {
+        return FALSE;
+    }
+    if ((issuer_len == 0) || (serial == NULL) || (serial_len == 0)) {
+        return FALSE;
+    }
+
+    while ((serial_len > 1) && (*serial == 0x00)) {
+        serial++;
+        serial_len--;
+    }
+
+    certId->X509IssuerName.charactersLen = issuer_len;
+    certId->X509SerialNumber.is_negative = 0;
+    return (exi_basetypes_convert_bytes_to_unsigned(&certId->X509SerialNumber.data,
+                                                    serial, serial_len) == EXI_ERROR__NO_ERROR);
+}
+
+static boolean fillListOfRootCertificateIds(struct iso2_ListOfRootCertificateIDsType *list)
+{
+    uint16_t root_count = gPnCHelper.len_v2g_root;
+
+    init_iso2_ListOfRootCertificateIDsType(list);
+    if ((root_count == 0) || (root_count > iso2_X509IssuerSerialType_5_ARRAY_SIZE)) {
+        return FALSE;
+    }
+
+    list->RootCertificateID.arrayLen = root_count;
+    for(uint16_t i = 0; i < root_count; i++)
+    {
+        if (!fillRootCertificateId(&list->RootCertificateID.array[i],
+                                   &gPnCHelper.v2g_root[i].cert)) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static boolean isValidCertificateChain(const struct iso2_CertificateChainType *chain)
+{
+    if ((chain->Certificate.bytesLen == 0) ||
+            (chain->Certificate.bytesLen > iso2_certificateType_BYTES_SIZE)) {
+        return FALSE;
+    }
+    if (chain->SubCertificates_isUsed &&
+            (chain->SubCertificates.Certificate.arrayLen > iso2_certificateType_4_ARRAY_SIZE)) {
+        return FALSE;
+    }
+    if (chain->SubCertificates_isUsed) {
+        for(uint16_t i = 0; i < chain->SubCertificates.Certificate.arrayLen; i++) {
+            uint16_t cert_len = chain->SubCertificates.Certificate.array[i].bytesLen;
+            if ((cert_len == 0) || (cert_len > iso2_certificateType_BYTES_SIZE)) {
+                return FALSE;
+            }
+        }
+    }
+    return TRUE;
+}
+
+/* ========================================================================= */
 DEF_INIT_MSG(CertificateInstallationReqType)
 template <typename T>
 static void sendCertificateInstallationReq(T *doc);
@@ -459,6 +604,39 @@ void sendCertificateInstallationReq<iso2_exiDocument>(iso2_exiDocument *doc)
     doc->V2G_Message.Body.CertificateInstallationReq_isUsed = 1u;
     init_iso2_CertificateInstallationReqType(&doc->V2G_Message.Body.CertificateInstallationReq);
     struct iso2_CertificateInstallationReqType *req = &doc->V2G_Message.Body.CertificateInstallationReq;
+
+    uint16_t pcid_len = (uint16_t)strlen((CHAR*)gPnCHelper.pcid);
+    ULONG cert_len = gPnCHelper.oem_pvn.cert.nx_secure_x509_certificate_data_length;
+
+    if (!copyBoundedString(req->Id.characters, iso2_Id_CHARACTER_SIZE,
+                           (const char*)gPnCHelper.pcid, pcid_len)) {
+        handleError(CHRGM_FAILED);
+        return;
+    }
+    req->Id.charactersLen = pcid_len;
+
+    if (!copyBoundedBytes(req->OEMProvisioningCert.bytes, iso2_certificateType_BYTES_SIZE,
+                          gPnCHelper.oem_pvn.cert.nx_secure_x509_certificate_data,
+                          cert_len)) {
+        handleError(CHRGM_FAILED);
+        return;
+    }
+    req->OEMProvisioningCert.bytesLen = (uint16_t)cert_len;
+
+    if (!fillListOfRootCertificateIds(&req->ListOfRootCertificateIDs)) {
+        handleError(CHRGM_FAILED);
+        return;
+    }
+
+    /* Hardware crypto candidate: CertificateInstallationReq XMLDSig/ECDSA signing
+     * should be offloaded to HSM/Crypto Driver when available so the OEM provisioning
+     * private key never leaves secure hardware.
+     */
+    ChrgM_Status.MsgTimer = _setTimer(V2G_EVCC_CertificateInstallationReq_Timeout);
+    transmitExi(doc);
+    return;
+
+#if 0
     /* [V2G2-236] */
     /* ID */
     memcpy(req->Id.characters, gPnCHelper.pcid, strlen((CHAR*)gPnCHelper.pcid));
@@ -513,6 +691,7 @@ void sendCertificateInstallationReq<iso2_exiDocument>(iso2_exiDocument *doc)
      * -------------------------------------------------------------------- */
     ChrgM_Status.MsgTimer = _setTimer(V2G_EVCC_CertificateInstallationReq_Timeout);
     transmitExi(doc);
+#endif
 }
  
 template <>
@@ -533,6 +712,53 @@ void sendCertificateUpdateReq<iso2_exiDocument>(iso2_exiDocument *doc)
     doc->V2G_Message.Body.CertificateUpdateReq_isUsed = 1u;
     init_iso2_CertificateUpdateReqType(&doc->V2G_Message.Body.CertificateUpdateReq);
     struct iso2_CertificateUpdateReqType *req = &doc->V2G_Message.Body.CertificateUpdateReq;
+
+    /* Step 1: Id - request identifier used by ISO 15118-2/XMLDSig references. */
+    uint16_t pcid_len = (uint16_t)strlen((CHAR*)gPnCHelper.pcid);
+    if (!copyBoundedString(req->Id.characters, iso2_Id_CHARACTER_SIZE,
+                           (const char*)gPnCHelper.pcid, pcid_len)) {
+        handleError(CHRGM_FAILED);
+        return;
+    }
+    req->Id.charactersLen = pcid_len;
+
+    /* Step 2: ContractSignatureCertChain - current contract certificate to be renewed. */
+    ULONG contract_cert_len =
+        gPnCHelper.contract[0].contract_cert.cert.nx_secure_x509_certificate_data_length;
+    req->ContractSignatureCertChain.Id_isUsed = 0u;
+    req->ContractSignatureCertChain.SubCertificates_isUsed = 0u;
+    if (!copyBoundedBytes(req->ContractSignatureCertChain.Certificate.bytes,
+                          iso2_certificateType_BYTES_SIZE,
+                          gPnCHelper.contract[0].contract_cert.cert.nx_secure_x509_certificate_data,
+                          contract_cert_len)) {
+        handleError(CHRGM_FAILED);
+        return;
+    }
+    req->ContractSignatureCertChain.Certificate.bytesLen = (uint16_t)contract_cert_len;
+
+    /* Step 3: eMAID - mandatory account identifier bound to the contract certificate. */
+    if (!copyBoundedString(req->eMAID.characters, iso2_eMAID_CHARACTER_SIZE,
+                           (const char*)ChrgM_Status.eMAID, ChrgM_Status.eMAIDLen)) {
+        handleError(CHRGM_FAILED);
+        return;
+    }
+    req->eMAID.charactersLen = ChrgM_Status.eMAIDLen;
+
+    /* Step 4: ListOfRootCertificateIDs - V2G roots the EV accepts from the SECC. */
+    if (!fillListOfRootCertificateIds(&req->ListOfRootCertificateIDs)) {
+        handleError(CHRGM_FAILED);
+        return;
+    }
+
+    /* Step 5: Header.Signature must be added by the XMLDSig helper before EXI encode.
+     * Hardware crypto candidate: CertificateUpdateReq XMLDSig/ECDSA signing can be
+     * offloaded to HSM/Crypto Driver using the contract private key from secure storage.
+     */
+    ChrgM_Status.MsgTimer = _setTimer(V2G_EVCC_CertificateUpdateReq_Timeout);
+    transmitExi(doc);
+    return;
+
+#if 0
     /* [V2G2-228] */
     /* ID */
     memcpy(req->Id.characters, gPnCHelper.pcid, strlen((CHAR*)gPnCHelper.pcid));
@@ -589,8 +815,9 @@ void sendCertificateUpdateReq<iso2_exiDocument>(iso2_exiDocument *doc)
     /* --------------------------------------------------------------------
      * 6. Mã hóa EXI và gửi
      * -------------------------------------------------------------------- */
-    ChrgM_Status.MsgTimer = _setTimer(V2G_EVCC_CertificateInstallationReq_Timeout);
+    ChrgM_Status.MsgTimer = _setTimer(V2G_EVCC_CertificateUpdateReq_Timeout);
     transmitExi(doc);
+#endif
 }
  
 template <>
@@ -655,6 +882,8 @@ static void sendPaymentDetailsReq(T *doc)
         memcpy(req->ContractSignatureCertChain.Certificate.bytes, \
                      gPnCHelper.contract[0].contract_cert.cert.nx_secure_x509_certificate_data, \
                      gPnCHelper.contract[0].contract_cert.cert.nx_secure_x509_certificate_data_length);
+        req->ContractSignatureCertChain.Certificate.bytesLen =
+                     (USHORT)gPnCHelper.contract[0].contract_cert.cert.nx_secure_x509_certificate_data_length;
     }
     ChrgM_Status.MsgTimer = _setTimer(V2G_EVCC_PaymentDetailsReq_Timeout);
     transmitExi(doc);
@@ -1035,17 +1264,31 @@ ChrgM_ResponseCodeType handleServiceDiscoveryRes<iso2_exiDocument>(struct iso2_e
                                         : iso2_EnergyTransferModeType_AC_single_phase_core;
     }
     ChrgM_Output.stEvseChMode = selectedMode;
-    iso2_paymentOptionType paymentOption;
-    for(uint8_t i = 0; i < iso2_paymentOptionType_2_ARRAY_SIZE; i++) {
-        if(res->PaymentOptionList.PaymentOption.array[i] == iso2_paymentOptionType_ExternalPayment) {
-            paymentOption = res->PaymentOptionList.PaymentOption.array[i];
-            break;
-        } else { /* Contract */
-            if(!ChrgM_Status.seccSecurity) { /* Secured with TLS */
+    iso2_paymentOptionType paymentOption = iso2_paymentOptionType_ExternalPayment;
+    boolean paymentOptionFound = FALSE;
+#ifdef VF_USE_NX_SECURE
+    if (_isTlsConnection()) {
+        for(uint8_t i = 0; i < res->PaymentOptionList.PaymentOption.arrayLen; i++) {
+            if(res->PaymentOptionList.PaymentOption.array[i] == iso2_paymentOptionType_Contract) {
                 paymentOption = res->PaymentOptionList.PaymentOption.array[i];
+                paymentOptionFound = TRUE;
                 break;
             }
         }
+    }
+#endif
+    if (paymentOptionFound == FALSE) {
+        for(uint8_t i = 0; i < res->PaymentOptionList.PaymentOption.arrayLen; i++) {
+            if(res->PaymentOptionList.PaymentOption.array[i] == iso2_paymentOptionType_ExternalPayment) {
+                paymentOption = res->PaymentOptionList.PaymentOption.array[i];
+                paymentOptionFound = TRUE;
+                break;
+            }
+        }
+    }
+    if (paymentOptionFound == FALSE) {
+        handleError(CHRGM_FAILED);
+        return FAILED;
     }
     /* [V2G2-490] */
     ChrgM_Status.state = PaymentServiceSelectionRes;
@@ -1064,17 +1307,18 @@ ChrgM_ResponseCodeType handleServiceDiscoveryRes<din_exiDocument>(struct din_exi
     auto *res = &doc->V2G_Message.Body.ServiceDiscoveryRes;
     din_EVSESupportedEnergyTransferType selectedMode = res->ChargeService.EnergyTransferType;
     ChrgM_Output.stEvseChMode = selectedMode;
-    din_paymentOptionType paymentOption;
-    for(uint8_t i = 0; i < din_paymentOptionType_2_ARRAY_SIZE; i++) {
+    din_paymentOptionType paymentOption = din_paymentOptionType_ExternalPayment;
+    boolean paymentOptionFound = FALSE;
+    for(uint8_t i = 0; i < res->PaymentOptions.PaymentOption.arrayLen; i++) {
         if(res->PaymentOptions.PaymentOption.array[i] == din_paymentOptionType_ExternalPayment) {
             paymentOption = res->PaymentOptions.PaymentOption.array[i];
+            paymentOptionFound = TRUE;
             break;
-        } else { /* Contract */
-            if(!ChrgM_Status.seccSecurity) { /* Secured with TLS */
-                paymentOption = res->PaymentOptions.PaymentOption.array[i];
-                break;
-            }
         }
+    }
+    if (paymentOptionFound == FALSE) {
+        handleError(CHRGM_FAILED);
+        return FAILED;
     }
     /* [V2G2-490] */
     ChrgM_Status.state = PaymentServiceSelectionRes;
@@ -1097,13 +1341,105 @@ ChrgM_ResponseCodeType handleCertificateInstallationRes<iso2_exiDocument>(iso2_e
     RESPONSE_CHECK(CertificateInstallationRes);
     MHU_STOP_CHARGING();
     auto *res = &doc->V2G_Message.Body.CertificateInstallationRes;
+
+    /* Step 1: Validate mandatory response payloads from ISO 15118-2 CertificateInstallationRes. */
+    if (!isValidCertificateChain(&res->SAProvisioningCertificateChain) ||
+            !isValidCertificateChain(&res->ContractSignatureCertChain) ||
+            (res->DHpublickey.CONTENT.bytesLen == 0) ||
+            (res->ContractSignatureEncryptedPrivateKey.CONTENT.bytesLen <= 16) ||
+            (((res->ContractSignatureEncryptedPrivateKey.CONTENT.bytesLen - 16) % 16) != 0) ||
+            (res->eMAID.CONTENT.charactersLen == 0) ||
+            (res->eMAID.CONTENT.charactersLen >= sizeof(ChrgM_Status.eMAID))) {
+        handleError(CHRGM_FAILED);
+        return FAILED;
+    }
+
+    /* Step 2: Split ContractSignatureEncryptedPrivateKey into AES-CBC IV and ciphertext. */
+    uint8_t *iv = &res->ContractSignatureEncryptedPrivateKey.CONTENT.bytes[0];
+    uint8_t *cipher = &res->ContractSignatureEncryptedPrivateKey.CONTENT.bytes[16];
+    uint16_t cipher_len = res->ContractSignatureEncryptedPrivateKey.CONTENT.bytesLen - 16;
+
+    /* Step 3: ECDH with EVCC private key and SECC DHpublickey to get shared secret Z.
+     * Hardware crypto candidate: replace PnCHlp_Shared_Secret_Compute()/crypto_method_ecdh
+     * with HSM/Crypto Driver ECDH so the EVCC private key stays inside secure hardware.
+     */
+    uint8_t shared_secret[32] = {0};
+    UINT shared_secret_actual_len = 0;
+    PnCHlp_Shared_Secret_Compute(&crypto_method_ecdh, res->DHpublickey.CONTENT.bytes,
+                                 res->DHpublickey.CONTENT.bytesLen, shared_secret,
+                                 sizeof(shared_secret), &shared_secret_actual_len);
+    if (shared_secret_actual_len != sizeof(shared_secret)) {
+        handleError(CHRGM_FAILED);
+        return FAILED;
+    }
+
+    /* Step 4: ISO 15118-2 KDF: SHA256(0x00000001 || Z || 0x01 || 0x55 || 0x56).
+     * Hardware crypto candidate: replace PnCHlp_SHA256() with hardware SHA-256
+     * when the crypto accelerator supports streaming/hash jobs.
+     */
+    uint8_t counter[4] = {0x00, 0x00, 0x00, 0x01};
+    uint8_t other_info[3] = {0x01, 0x55, 0x56};
+    uint8_t kdf_input[4 + sizeof(shared_secret) + 3] = {0};
+    uint8_t hash[32] = {0};
+    uint8_t aes_key[16] = {0};
+
+    memcpy(kdf_input, counter, sizeof(counter));
+    memcpy(kdf_input + sizeof(counter), shared_secret, sizeof(shared_secret));
+    memcpy(kdf_input + sizeof(counter) + sizeof(shared_secret), other_info, sizeof(other_info));
+    PnCHlp_SHA256(kdf_input, sizeof(kdf_input), hash);
+    memcpy(aes_key, hash, sizeof(aes_key));
+
+    /* Step 5: Decrypt contract private key with AES-128-CBC using the derived key.
+     * Hardware crypto candidate: replace PnCHlp_DeCryt_ContractPrivateKey()/AES-CBC
+     * with HSM/Crypto Driver AES-CBC decrypt and import the key directly to secure storage.
+     */
+    uint8_t plain_privateKey[128] = {0};
+    uint16_t plain_privateKeyLen = 0;
+    PnCHlp_DeCryt_ContractPrivateKey(&crypto_method_aes_cbc_128, aes_key, iv, cipher,
+                                     cipher_len, plain_privateKey, &plain_privateKeyLen);
+    if ((plain_privateKeyLen == 0) || (plain_privateKeyLen > sizeof(plain_privateKey))) {
+        handleError(CHRGM_FAILED);
+        return FAILED;
+    }
+
+    /* Step 6: Store contract certificate/private key and optional sub-CA certificates.
+     * Hardware security candidate: private-key persistence should use HSM-backed key
+     * import/secure NVM instead of writing plaintext key bytes to software-managed flash.
+     */
+    struct iso2_CertificateChainType *contract_chain = &res->ContractSignatureCertChain;
+    PnCHlp_Contract_Add(contract_chain->Certificate.bytes, contract_chain->Certificate.bytesLen,
+                        plain_privateKey, plain_privateKeyLen);
+    if(contract_chain->SubCertificates_isUsed) {
+        for(uint8_t i = 0; i < contract_chain->SubCertificates.Certificate.arrayLen; i++) {
+            PnCHlp_SubContractCA_Add(contract_chain->SubCertificates.Certificate.array[i].bytes,
+                                     contract_chain->SubCertificates.Certificate.array[i].bytesLen, i);
+        }
+    }
+
+    /* Step 7: Store SA provisioning chain for future update requests when storage API is available. */
+    /* TODO - Add PnCHlp_SAProvisioning_Add() or equivalent flash persistence. */
+
+    /* Step 8: Cache eMAID for PaymentDetailsReq and later CertificateUpdateReq. */
+    memcpy(ChrgM_Status.eMAID, res->eMAID.CONTENT.characters, res->eMAID.CONTENT.charactersLen);
+    ChrgM_Status.eMAIDLen = res->eMAID.CONTENT.charactersLen;
+
+    /* Step 9: Continue ISO 15118-2 PnC flow with PaymentDetailsReq. */
+    ChrgM_Status.state = PaymentDetailsRes;
+    sendPaymentDetailsReq(doc);
+    return Ok;
+
+#if 0
  
     /* ContractSignatureEncryptedPrivateKey */
     /*[V2G2-817]*/
+    if (res->ContractSignatureEncryptedPrivateKey.CONTENT.bytesLen <= 16) {
+        handleError(CHRGM_FAILED);
+        return FAILED;
+    }
     uint8_t *iv = &res->ContractSignatureEncryptedPrivateKey.CONTENT.bytes[0];
     uint8_t *cipher = &res->ContractSignatureEncryptedPrivateKey.CONTENT.bytes[16];
  
-    uint8_t cipher_len = res->ContractSignatureEncryptedPrivateKey.CONTENT.bytesLen - 16;
+    uint16_t cipher_len = res->ContractSignatureEncryptedPrivateKey.CONTENT.bytesLen - 16;
     /* [V2G2-815]       shared_secret (Z) = ECDH(EVCC_private_key, DHpublickey)
                                     session_key = KDF_SHA256(shared_secret, params) → 128-bit
  
@@ -1153,6 +1489,7 @@ ChrgM_ResponseCodeType handleCertificateInstallationRes<iso2_exiDocument>(iso2_e
     sendPaymentDetailsReq(doc);
  
     return Ok;
+#endif
 }
  
 template <>
@@ -1172,12 +1509,100 @@ ChrgM_ResponseCodeType handleCertificateUpdateRes<iso2_exiDocument>(iso2_exiDocu
     MHU_STOP_CHARGING();
  
     auto *res = &doc->V2G_Message.Body.CertificateUpdateRes;
+
+    /* Step 1: Validate mandatory response payloads from ISO 15118-2 CertificateUpdateRes. */
+    if (!isValidCertificateChain(&res->ContractSignatureCertChain) ||
+            (res->DHpublickey.CONTENT.bytesLen == 0) ||
+            (res->ContractSignatureEncryptedPrivateKey.CONTENT.bytesLen <= 16) ||
+            (((res->ContractSignatureEncryptedPrivateKey.CONTENT.bytesLen - 16) % 16) != 0) ||
+            (res->eMAID.CONTENT.charactersLen == 0) ||
+            (res->eMAID.CONTENT.charactersLen >= sizeof(ChrgM_Status.eMAID))) {
+        handleError(CHRGM_FAILED);
+        return FAILED;
+    }
+
+    /* Step 2: Split ContractSignatureEncryptedPrivateKey into AES-CBC IV and ciphertext. */
+    uint8_t *iv = &res->ContractSignatureEncryptedPrivateKey.CONTENT.bytes[0];
+    uint8_t *cipher = &res->ContractSignatureEncryptedPrivateKey.CONTENT.bytes[16];
+    uint16_t cipher_len = res->ContractSignatureEncryptedPrivateKey.CONTENT.bytesLen - 16;
+
+    /* Step 3: ECDH with EVCC private key and SECC DHpublickey to get shared secret Z.
+     * Hardware crypto candidate: replace PnCHlp_Shared_Secret_Compute()/crypto_method_ecdh
+     * with HSM/Crypto Driver ECDH so the EVCC private key stays inside secure hardware.
+     */
+    uint8_t shared_secret[32] = {0};
+    UINT shared_secret_actual_len = 0;
+    PnCHlp_Shared_Secret_Compute(&crypto_method_ecdh, res->DHpublickey.CONTENT.bytes,
+                                 res->DHpublickey.CONTENT.bytesLen, shared_secret,
+                                 sizeof(shared_secret), &shared_secret_actual_len);
+    if (shared_secret_actual_len != sizeof(shared_secret)) {
+        handleError(CHRGM_FAILED);
+        return FAILED;
+    }
+
+    /* Step 4: ISO 15118-2 KDF: SHA256(0x00000001 || Z || 0x01 || 0x55 || 0x56).
+     * Hardware crypto candidate: replace PnCHlp_SHA256() with hardware SHA-256
+     * when the crypto accelerator supports streaming/hash jobs.
+     */
+    uint8_t counter[4] = {0x00, 0x00, 0x00, 0x01};
+    uint8_t other_info[3] = {0x01, 0x55, 0x56};
+    uint8_t kdf_input[4 + sizeof(shared_secret) + 3] = {0};
+    uint8_t hash[32] = {0};
+    uint8_t aes_key[16] = {0};
+
+    memcpy(kdf_input, counter, sizeof(counter));
+    memcpy(kdf_input + sizeof(counter), shared_secret, sizeof(shared_secret));
+    memcpy(kdf_input + sizeof(counter) + sizeof(shared_secret), other_info, sizeof(other_info));
+    PnCHlp_SHA256(kdf_input, sizeof(kdf_input), hash);
+    memcpy(aes_key, hash, sizeof(aes_key));
+
+    /* Step 5: Decrypt updated contract private key with AES-128-CBC using the derived key.
+     * Hardware crypto candidate: replace PnCHlp_DeCryt_ContractPrivateKey()/AES-CBC
+     * with HSM/Crypto Driver AES-CBC decrypt and import the key directly to secure storage.
+     */
+    uint8_t plain_privateKey[128] = {0};
+    uint16_t plain_privateKeyLen = 0;
+    PnCHlp_DeCryt_ContractPrivateKey(&crypto_method_aes_cbc_128, aes_key, iv, cipher,
+                                     cipher_len, plain_privateKey, &plain_privateKeyLen);
+    if ((plain_privateKeyLen == 0) || (plain_privateKeyLen > sizeof(plain_privateKey))) {
+        handleError(CHRGM_FAILED);
+        return FAILED;
+    }
+
+    /* Step 6: Replace stored contract certificate/private key and optional sub-CA certificates.
+     * Hardware security candidate: private-key persistence should use HSM-backed key
+     * import/secure NVM instead of writing plaintext key bytes to software-managed flash.
+     */
+    struct iso2_CertificateChainType *contract_chain = &res->ContractSignatureCertChain;
+    PnCHlp_Contract_Add(contract_chain->Certificate.bytes, contract_chain->Certificate.bytesLen,
+                        plain_privateKey, plain_privateKeyLen);
+    if(contract_chain->SubCertificates_isUsed) {
+        for(uint8_t i = 0; i < contract_chain->SubCertificates.Certificate.arrayLen; i++) {
+            PnCHlp_SubContractCA_Add(contract_chain->SubCertificates.Certificate.array[i].bytes,
+                                     contract_chain->SubCertificates.Certificate.array[i].bytesLen, i);
+        }
+    }
+
+    /* Step 7: Cache updated eMAID for PaymentDetailsReq and later update checks. */
+    memcpy(ChrgM_Status.eMAID, res->eMAID.CONTENT.characters, res->eMAID.CONTENT.charactersLen);
+    ChrgM_Status.eMAIDLen = res->eMAID.CONTENT.charactersLen;
+
+    /* Step 8: Continue ISO 15118-2 PnC flow with PaymentDetailsReq. */
+    ChrgM_Status.state = PaymentDetailsRes;
+    sendPaymentDetailsReq(doc);
+    return Ok;
+
+#if 0
     /* ContractSignatureEncryptedPrivateKey */
     /*[V2G2-817]*/
+    if (res->ContractSignatureEncryptedPrivateKey.CONTENT.bytesLen <= 16) {
+        handleError(CHRGM_FAILED);
+        return FAILED;
+    }
     uint8_t *iv = &res->ContractSignatureEncryptedPrivateKey.CONTENT.bytes[0];
     uint8_t *cipher = &res->ContractSignatureEncryptedPrivateKey.CONTENT.bytes[16];
  
-    uint8_t cipher_len = res->ContractSignatureEncryptedPrivateKey.CONTENT.bytesLen - 16;
+    uint16_t cipher_len = res->ContractSignatureEncryptedPrivateKey.CONTENT.bytesLen - 16;
     /* [V2G2-815]       shared_secret (Z) = ECDH(EVCC_private_key, DHpublickey)
                                     session_key = KDF_SHA256(shared_secret, params) → 128-bit
  
@@ -1228,6 +1653,7 @@ ChrgM_ResponseCodeType handleCertificateUpdateRes<iso2_exiDocument>(iso2_exiDocu
     sendPaymentDetailsReq(doc);
  
     return Ok;
+#endif
 }
  
 template <>
@@ -1237,6 +1663,43 @@ ChrgM_ResponseCodeType handleCertificateUpdateRes<din_exiDocument>(din_exiDocume
 }
 #endif
 /* ========================================================================= */
+#ifdef VF_USE_NX_SECURE
+template <typename T>
+static ChrgM_ResponseCodeType sendNextContractCertificateMessage(T *doc,
+                                                                 ChrgM_ErrorHandlerType cert_status)
+{
+    switch (cert_status)
+    {
+    case CHRGM_NoCertificateAvailable:
+        /* No contract certificate exists yet: install a new contract certificate using OEM provisioning cert. */
+        ChrgM_Status.state = CertificateInstallationRes;
+        sendCertificateInstallationReq(doc);
+        break;
+    case CHRGM_CertificateExpired:
+        /* Expired contract certificate cannot be used for update authorization: install a new one. */
+        ChrgM_Status.state = CertificateInstallationRes;
+        sendCertificateInstallationReq(doc);
+        break;
+    case CHRGM_CertificateExpiredSoon:
+        /* Contract certificate is still valid but near expiry: renew it before authorization/payment. */
+        ChrgM_Status.state = CertificateUpdateRes;
+        sendCertificateUpdateReq(doc);
+        break;
+    case CHRGM_Error_None:
+        /* Contract certificate and private key are available and valid: continue normal PnC flow. */
+        ChrgM_Status.state = PaymentDetailsRes;
+        sendPaymentDetailsReq(doc);
+        break;
+    default:
+        handleError(cert_status);
+        return FAILED;
+    }
+
+    return Ok;
+}
+#endif
+
+/* ========================================================================= */
 template <typename T>
 static ChrgM_ResponseCodeType handlePaymentServiceSelectionRes(T *doc)
 {
@@ -1245,24 +1708,10 @@ static ChrgM_ResponseCodeType handlePaymentServiceSelectionRes(T *doc)
     if(ChrgM_Status.payContract == 1){
 #ifdef VF_USE_NX_SECURE
         ChrgM_ErrorHandlerType ret = handleCheckCertificate();
-        switch (ret)
-        {
-        case CHRGM_CertificateExpiredSoon:
-            ChrgM_Status.state = CertificateUpdateRes;
-            sendCertificateUpdateReq(doc);
-            break;
-        case CHRGM_NoCertificateAvailable:
-        case CHRGM_CertificateExpired:
-            ChrgM_Status.state = CertificateInstallationRes;
-            sendCertificateInstallationReq(doc);
-            break;
-        case CHRGM_Error_None:
-            ChrgM_Status.state = PaymentDetailsRes;
-            sendPaymentDetailsReq(doc);
-            break;
-        default:
-            break;
-        }
+        return sendNextContractCertificateMessage(doc, ret);
+#else
+        handleError(CHRGM_FAILED);
+        return FAILED;
 #endif
     } else {
         
@@ -1288,8 +1737,9 @@ static ChrgM_ResponseCodeType handlePaymentDetailsRes(T *doc)
         memcpy(ChrgM_Status.genChallenge, res->GenChallenge.bytes, iso2_genChallengeType_BYTES_SIZE);
         ULONG EVSETimeStamp = res->EVSETimeStamp;
     }
- 
+
     ChrgM_Status.state = AuthorizationRes;
+    ChrgM_Status.OngoingTimer = _setTimer(V2G_EVCC_Ongoing_Timeout);
     sendAuthorizationReq(doc);
  
     return Ok;
@@ -1396,6 +1846,9 @@ static ChrgM_ResponseCodeType handleChargeParameterDiscoveryRes(T *doc)
             ChrgM_Status.state = CableCheckRes;
             ChrgM_Status.CableCheckTimer = _setTimer(V2G_EVCC_CableCheck_Timeout);
             ChrgM_Status.MsgTimer = _setTimer(10000);
+            if ((ChrgM_Status.CpState == CpStatus_C) || (ChrgM_Input.preCondCloseS2 == 1)) {
+                sendCableCheckReq(doc);
+            }
         }
     }
     else
@@ -1475,6 +1928,9 @@ static ChrgM_ResponseCodeType handlePowerDeliveryRes(T *doc)
         ChrgM_Status.MsgTimer = _setTimer(10000);
         if(endState == WeldingDetectionRes){
             ChrgM_Status.OngoingTimer = _setTimer(V2G_EVCC_Ongoing_Timeout);
+            if (ChrgM_Status.CpState == CpStatus_B) {
+                sendWeldingDetectionReq(doc);
+            }
     } else {
             sendSessionStopReq(doc);
         }
@@ -1596,7 +2052,7 @@ static ChrgM_ResponseCodeType handleSessionStopRes(T *doc)
 {
     RESPONSE_CHECK(SessionStopRes);
     ChrgM_Status.state = ChrgM_Idle;
-    SoAd_CloseSoCon(SoAdConf_Tcp, false);
+    SoAd_CloseSoCon(_isTlsConnection() ? SoAdConf_Tls : SoAdConf_Tcp, false);
     return Ok;
 }
  
