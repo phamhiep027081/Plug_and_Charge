@@ -1,0 +1,15 @@
+[ req ]
+distinguished_name = dn
+prompt = no
+
+[ dn ]
+C=VN
+O=VinFast OEM
+CN=EV-Provisioning-001
+
+[ oem_leaf_ext ]
+basicConstraints        = critical, CA:false
+keyUsage                = critical, digitalSignature
+extendedKeyUsage        = clientAuth
+subjectKeyIdentifier    = hash
+authorityKeyIdentifier  = keyid:always

@@ -1,0 +1,14 @@
+[ req ]
+distinguished_name = dn
+prompt = no
+
+[ dn ]
+C=VN
+O=OEM
+CN=OEM-Sub-CA1
+
+[ oem_ca_ext ]
+basicConstraints = critical, CA:true, pathlen:0
+keyUsage = critical, keyCertSign, cRLSign
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always

@@ -1,0 +1,15 @@
+
+[ req ]
+distinguished_name = dn
+prompt             = no
+
+[ dn ]
+C  = VN
+O  = CPO
+CN = CPO-Sub-CA2
+
+[ cpo_ca_ext ]
+basicConstraints       = critical, CA:true, pathlen:0
+keyUsage               = critical, keyCertSign, cRLSign
+subjectKeyIdentifier   = hash
+authorityKeyIdentifier = keyid:always

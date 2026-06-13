@@ -1,0 +1,16 @@
+[ req ]
+distinguished_name = dn
+prompt = no
+
+[ dn ]
+C=VN
+O=CPO
+CN=EVSE-001
+
+[ evse_ext ]
+basicConstraints = critical, CA:false
+keyUsage = critical, digitalSignature, keyAgreement
+extendedKeyUsage = serverAuth
+subjectKeyIdentifier = hash
+authorityKeyIdentifier = keyid:always
+
