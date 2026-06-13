@@ -5,8 +5,6 @@
 #include "cbv2g/din/din_msgDefDecoder.h"
 #include "cbv2g/din/din_msgDefEncoder.h"
 #include "cbv2g/exi_v2gtp.h"
-#include "cbv2g/common/exi_basetypes.h"
-#include "cbv2g/common/exi_error_codes.h"
 #include "Iso15118_2.h"
 #include "ChrgM.h"
 #include "ChrgM_Helper.hpp"
@@ -14,6 +12,10 @@
 // #ifndef VF_USE_NX_SECURE
 // #define VF_USE_NX_SECURE
 // #endif
+
+#if defined(PNC_USE_HSE_CRYPTO) && !defined(VF_USE_NX_SECURE)
+#define VF_USE_NX_SECURE
+#endif
  
 #ifdef VF_USE_NX_SECURE
 #include "PnC_Helper.h"
@@ -46,13 +48,28 @@ extern "C"
 #ifdef VF_USE_NX_SECURE
 #define IS_SECURE (1)
 extern PnC_Helper_t gPnCHelper;
-/* These NetX crypto methods currently use the configured software crypto backend.
- * They are the main replacement points for a hardware crypto driver/HSM:
- * - ECDH P-256 shared-secret calculation
- * - AES-128-CBC contract private-key decryption
+/* Crypto backend selection:
+ * - Default build uses NetX Secure software crypto.
+ * - Define PNC_USE_HSE_CRYPTO to route these operations to a Hardware Security
+ *   Engine (HSE): AES-128/192/256, RSA/ECC, side-channel protected key ops,
+ *   secure boot anchored trust and hardware-backed key storage.
+ *
+ * PnC material that belongs in HSE:
+ * - OEM provisioning private key, Contract Signature private key, TLS private key.
+ * - ECDH ephemeral private key, derived AES key and XMLDSig/ECDSA signing key.
+ *
+ * PnC material that belongs in NVM/Flash:
+ * - Public DER certificates: OEM provisioning cert, Contract cert chain, Sub-CA,
+ *   SAProvisioning chain and V2G root CAs/trust anchors.
+ * - eMAID, PCID, notAfter/validity metadata, update policy and audit/error state.
  */
+#ifdef PNC_USE_HSE_CRYPTO
+extern PnC_CryptoMethod_t crypto_method_ecdh;
+extern PnC_CryptoMethod_t crypto_method_aes_cbc_128;
+#else
 extern NX_CRYPTO_METHOD crypto_method_ecdh;
 extern NX_CRYPTO_METHOD crypto_method_aes_cbc_128;
+#endif
 #else
 #define IS_SECURE (0)
 #endif
@@ -320,8 +337,20 @@ static ChrgM_ErrorHandlerType handleCheckCertificate(void)
     asn1_time[10] = '0' + (BCD_TO_DEC(date_time[5]) / 10);
     asn1_time[11] = '0' + (BCD_TO_DEC(date_time[5]) % 10);
     asn1_time[12] = 'Z';
-    status = PnCHlp_Asn1UtcTimeToUnix(asn1_time, sizeof(asn1_time), NX_SECURE_ASN_TAG_UTC_TIME, &unix_time);
-    if (status != NX_SECURE_X509_SUCCESS)
+    status = PnCHlp_Asn1UtcTimeToUnix(asn1_time, sizeof(asn1_time),
+#ifdef PNC_USE_HSE_CRYPTO
+                                      PNC_ASN_TAG_UTC_TIME,
+#else
+                                      NX_SECURE_ASN_TAG_UTC_TIME,
+#endif
+                                      &unix_time);
+    if (status !=
+#ifdef PNC_USE_HSE_CRYPTO
+            PNC_X509_SUCCESS
+#else
+            NX_SECURE_X509_SUCCESS
+#endif
+    )
     {
         return CHRGM_FAILED;
     }
@@ -330,10 +359,34 @@ static ChrgM_ErrorHandlerType handleCheckCertificate(void)
             (ChrgM_Status.eMAIDLen == 0)) {
         return CHRGM_NoCertificateAvailable;
     }
-    if((_nx_secure_x509_expiration_check(&gPnCHelper.contract[0].contract_cert.cert, unix_time) == NX_SECURE_X509_CERTIFICATE_EXPIRED)) {
+    if((
+#ifdef PNC_USE_HSE_CRYPTO
+            PnCHse_X509ExpirationCheck(&gPnCHelper.contract[0].contract_cert.cert, unix_time)
+#else
+            _nx_secure_x509_expiration_check(&gPnCHelper.contract[0].contract_cert.cert, unix_time)
+#endif
+            ==
+#ifdef PNC_USE_HSE_CRYPTO
+            PNC_X509_CERTIFICATE_EXPIRED
+#else
+            NX_SECURE_X509_CERTIFICATE_EXPIRED
+#endif
+            )) {
         return CHRGM_CertificateExpired;
     }
-    if((_nx_secure_x509_expiration_check(&gPnCHelper.contract[0].contract_cert.cert, (unix_time + future)) == NX_SECURE_X509_CERTIFICATE_EXPIRED)) {
+    if((
+#ifdef PNC_USE_HSE_CRYPTO
+            PnCHse_X509ExpirationCheck(&gPnCHelper.contract[0].contract_cert.cert, (unix_time + future))
+#else
+            _nx_secure_x509_expiration_check(&gPnCHelper.contract[0].contract_cert.cert, (unix_time + future))
+#endif
+            ==
+#ifdef PNC_USE_HSE_CRYPTO
+            PNC_X509_CERTIFICATE_EXPIRED
+#else
+            NX_SECURE_X509_CERTIFICATE_EXPIRED
+#endif
+            )) {
         return CHRGM_CertificateExpiredSoon;
     }
     
@@ -464,134 +517,6 @@ static void sendSessionSetupReq(T *doc)
 #ifdef VF_USE_NX_SECURE
  
 /* ========================================================================= */
-static boolean copyBoundedBytes(uint8_t *dst, uint16_t dst_size, const uint8_t *src, ULONG src_len)
-{
-    if ((src == NULL) || (src_len == 0) || (src_len > dst_size)) {
-        return FALSE;
-    }
-
-    memcpy(dst, src, src_len);
-    return TRUE;
-}
-
-static boolean copyBoundedString(char *dst, uint16_t dst_size, const char *src, uint16_t src_len)
-{
-    if ((src == NULL) || (src_len == 0) || (src_len >= dst_size)) {
-        return FALSE;
-    }
-
-    memcpy(dst, src, src_len);
-    return TRUE;
-}
-
-static boolean appendDnComponent(char *dst, uint16_t dst_size, uint16_t *offset,
-                                const char *prefix, const UCHAR *value, uint16_t value_len)
-{
-    if ((value == NULL) || (value_len == 0)) {
-        return TRUE;
-    }
-
-    uint16_t prefix_len = (uint16_t)strlen(prefix);
-    uint16_t sep_len = (*offset == 0) ? 0 : 1;
-    if ((*offset + sep_len + prefix_len + value_len) >= dst_size) {
-        return FALSE;
-    }
-
-    if (sep_len != 0) {
-        dst[*offset] = ',';
-        (*offset)++;
-    }
-    memcpy(&dst[*offset], prefix, prefix_len);
-    *offset += prefix_len;
-    memcpy(&dst[*offset], value, value_len);
-    *offset += value_len;
-    return TRUE;
-}
-
-static boolean fillRootCertificateId(struct iso2_X509IssuerSerialType *certId,
-                                     const NX_SECURE_X509_CERT *cert)
-{
-    const UCHAR *serial = cert->nx_secure_x509_issuer.nx_secure_x509_serial_number;
-    uint16_t serial_len = cert->nx_secure_x509_issuer.nx_secure_x509_serial_number_length;
-    uint16_t issuer_len = 0;
-
-    init_iso2_X509IssuerSerialType(certId);
-
-    if (!appendDnComponent(certId->X509IssuerName.characters, iso2_X509IssuerName_CHARACTER_SIZE,
-                           &issuer_len, "C=",
-                           cert->nx_secure_x509_issuer.nx_secure_x509_country,
-                           cert->nx_secure_x509_issuer.nx_secure_x509_country_length)) {
-        return FALSE;
-    }
-    if (!appendDnComponent(certId->X509IssuerName.characters, iso2_X509IssuerName_CHARACTER_SIZE,
-                           &issuer_len, "O=",
-                           cert->nx_secure_x509_issuer.nx_secure_x509_organization,
-                           cert->nx_secure_x509_issuer.nx_secure_x509_organization_length)) {
-        return FALSE;
-    }
-    if (!appendDnComponent(certId->X509IssuerName.characters, iso2_X509IssuerName_CHARACTER_SIZE,
-                           &issuer_len, "CN=",
-                           cert->nx_secure_x509_issuer.nx_secure_x509_common_name,
-                           cert->nx_secure_x509_issuer.nx_secure_x509_common_name_length)) {
-        return FALSE;
-    }
-    if ((issuer_len == 0) || (serial == NULL) || (serial_len == 0)) {
-        return FALSE;
-    }
-
-    while ((serial_len > 1) && (*serial == 0x00)) {
-        serial++;
-        serial_len--;
-    }
-
-    certId->X509IssuerName.charactersLen = issuer_len;
-    certId->X509SerialNumber.is_negative = 0;
-    return (exi_basetypes_convert_bytes_to_unsigned(&certId->X509SerialNumber.data,
-                                                    serial, serial_len) == EXI_ERROR__NO_ERROR);
-}
-
-static boolean fillListOfRootCertificateIds(struct iso2_ListOfRootCertificateIDsType *list)
-{
-    uint16_t root_count = gPnCHelper.len_v2g_root;
-
-    init_iso2_ListOfRootCertificateIDsType(list);
-    if ((root_count == 0) || (root_count > iso2_X509IssuerSerialType_5_ARRAY_SIZE)) {
-        return FALSE;
-    }
-
-    list->RootCertificateID.arrayLen = root_count;
-    for(uint16_t i = 0; i < root_count; i++)
-    {
-        if (!fillRootCertificateId(&list->RootCertificateID.array[i],
-                                   &gPnCHelper.v2g_root[i].cert)) {
-            return FALSE;
-        }
-    }
-    return TRUE;
-}
-
-static boolean isValidCertificateChain(const struct iso2_CertificateChainType *chain)
-{
-    if ((chain->Certificate.bytesLen == 0) ||
-            (chain->Certificate.bytesLen > iso2_certificateType_BYTES_SIZE)) {
-        return FALSE;
-    }
-    if (chain->SubCertificates_isUsed &&
-            (chain->SubCertificates.Certificate.arrayLen > iso2_certificateType_4_ARRAY_SIZE)) {
-        return FALSE;
-    }
-    if (chain->SubCertificates_isUsed) {
-        for(uint16_t i = 0; i < chain->SubCertificates.Certificate.arrayLen; i++) {
-            uint16_t cert_len = chain->SubCertificates.Certificate.array[i].bytesLen;
-            if ((cert_len == 0) || (cert_len > iso2_certificateType_BYTES_SIZE)) {
-                return FALSE;
-            }
-        }
-    }
-    return TRUE;
-}
-
-/* ========================================================================= */
 DEF_INIT_MSG(CertificateInstallationReqType)
 template <typename T>
 static void sendCertificateInstallationReq(T *doc);
@@ -599,31 +524,26 @@ static void sendCertificateInstallationReq(T *doc);
 template <>
 void sendCertificateInstallationReq<iso2_exiDocument>(iso2_exiDocument *doc)
 {
+    /* ISO 15118-2 PnC certificate installation request.
+     * Preconditions:
+     * - EV selected Plug & Charge in PaymentServiceSelection.
+     * - No Contract Certificate/private key/eMAID is installed, or the stored
+     *   Contract Certificate is expired and cannot be used for update.
+     *
+     * Active steps:
+     * 1. Prepare signed V2G message header/session ID.
+     * 2. Build CertificateInstallationReq:
+     *    Id, OEMProvisioningCert, ListOfRootCertificateIDs.
+     * 3. XMLDSig/ECDSA-sign the request with OEM provisioning key.
+     *    Software path uses NetX Secure crypto APIs; HSE path should sign with
+     *    a non-exportable OEM provisioning private key.
+     * 4. EXI encode and transmit to EVSE; EVSE forwards to CSMS/OCPP backend.
+     */
     prepareExi(doc);
  
     doc->V2G_Message.Body.CertificateInstallationReq_isUsed = 1u;
-    init_iso2_CertificateInstallationReqType(&doc->V2G_Message.Body.CertificateInstallationReq);
-    struct iso2_CertificateInstallationReqType *req = &doc->V2G_Message.Body.CertificateInstallationReq;
-
-    uint16_t pcid_len = (uint16_t)strlen((CHAR*)gPnCHelper.pcid);
-    ULONG cert_len = gPnCHelper.oem_pvn.cert.nx_secure_x509_certificate_data_length;
-
-    if (!copyBoundedString(req->Id.characters, iso2_Id_CHARACTER_SIZE,
-                           (const char*)gPnCHelper.pcid, pcid_len)) {
-        handleError(CHRGM_FAILED);
-        return;
-    }
-    req->Id.charactersLen = pcid_len;
-
-    if (!copyBoundedBytes(req->OEMProvisioningCert.bytes, iso2_certificateType_BYTES_SIZE,
-                          gPnCHelper.oem_pvn.cert.nx_secure_x509_certificate_data,
-                          cert_len)) {
-        handleError(CHRGM_FAILED);
-        return;
-    }
-    req->OEMProvisioningCert.bytesLen = (uint16_t)cert_len;
-
-    if (!fillListOfRootCertificateIds(&req->ListOfRootCertificateIDs)) {
+    if (PnCHlp_BuildCertificateInstallationReq(
+            &doc->V2G_Message.Body.CertificateInstallationReq) != PNC_HELPER_OK) {
         handleError(CHRGM_FAILED);
         return;
     }
@@ -707,50 +627,38 @@ static void sendCertificateUpdateReq(T *doc);
 template <>
 void sendCertificateUpdateReq<iso2_exiDocument>(iso2_exiDocument *doc)
 {
+    /* ISO 15118-2 PnC certificate update request.
+     * Preconditions:
+     * - EV selected Plug & Charge.
+     * - A valid Contract Certificate/private key/eMAID exists.
+     * - The certificate is inside the renewal window but not expired.
+     *
+     * Active steps:
+     * 1. Prepare signed V2G message header/session ID.
+     * 2. Build CertificateUpdateReq:
+     *    Id, current ContractSignatureCertChain, eMAID, ListOfRootCertificateIDs.
+     * 3. XMLDSig/ECDSA-sign the request with the current Contract Signature key.
+     *    Software path uses NetX Secure crypto APIs; HSE path should sign with
+     *    a non-exportable Contract Signature private key handle.
+     * 4. EXI encode and transmit to EVSE; EVSE forwards to CSMS/OCPP backend.
+     */
     prepareExi(doc);
  
     doc->V2G_Message.Body.CertificateUpdateReq_isUsed = 1u;
-    init_iso2_CertificateUpdateReqType(&doc->V2G_Message.Body.CertificateUpdateReq);
-    struct iso2_CertificateUpdateReqType *req = &doc->V2G_Message.Body.CertificateUpdateReq;
-
-    /* Step 1: Id - request identifier used by ISO 15118-2/XMLDSig references. */
-    uint16_t pcid_len = (uint16_t)strlen((CHAR*)gPnCHelper.pcid);
-    if (!copyBoundedString(req->Id.characters, iso2_Id_CHARACTER_SIZE,
-                           (const char*)gPnCHelper.pcid, pcid_len)) {
+    PnC_EMAID_t emaid = {0};
+    if (ChrgM_Status.eMAIDLen >= sizeof(emaid.characters)) {
         handleError(CHRGM_FAILED);
         return;
     }
-    req->Id.charactersLen = pcid_len;
-
-    /* Step 2: ContractSignatureCertChain - current contract certificate to be renewed. */
-    ULONG contract_cert_len =
-        gPnCHelper.contract[0].contract_cert.cert.nx_secure_x509_certificate_data_length;
-    req->ContractSignatureCertChain.Id_isUsed = 0u;
-    req->ContractSignatureCertChain.SubCertificates_isUsed = 0u;
-    if (!copyBoundedBytes(req->ContractSignatureCertChain.Certificate.bytes,
-                          iso2_certificateType_BYTES_SIZE,
-                          gPnCHelper.contract[0].contract_cert.cert.nx_secure_x509_certificate_data,
-                          contract_cert_len)) {
-        handleError(CHRGM_FAILED);
-        return;
-    }
-    req->ContractSignatureCertChain.Certificate.bytesLen = (uint16_t)contract_cert_len;
-
-    /* Step 3: eMAID - mandatory account identifier bound to the contract certificate. */
-    if (!copyBoundedString(req->eMAID.characters, iso2_eMAID_CHARACTER_SIZE,
-                           (const char*)ChrgM_Status.eMAID, ChrgM_Status.eMAIDLen)) {
-        handleError(CHRGM_FAILED);
-        return;
-    }
-    req->eMAID.charactersLen = ChrgM_Status.eMAIDLen;
-
-    /* Step 4: ListOfRootCertificateIDs - V2G roots the EV accepts from the SECC. */
-    if (!fillListOfRootCertificateIds(&req->ListOfRootCertificateIDs)) {
+    memcpy(emaid.characters, ChrgM_Status.eMAID, ChrgM_Status.eMAIDLen);
+    emaid.charactersLen = ChrgM_Status.eMAIDLen;
+    if (PnCHlp_BuildCertificateUpdateReq(
+            &doc->V2G_Message.Body.CertificateUpdateReq, &emaid) != PNC_HELPER_OK) {
         handleError(CHRGM_FAILED);
         return;
     }
 
-    /* Step 5: Header.Signature must be added by the XMLDSig helper before EXI encode.
+    /* Header.Signature must be added by the XMLDSig helper before EXI encode.
      * Hardware crypto candidate: CertificateUpdateReq XMLDSig/ECDSA signing can be
      * offloaded to HSM/Crypto Driver using the contract private key from secure storage.
      */
@@ -1240,6 +1148,24 @@ static ChrgM_ResponseCodeType handleSessionSetupRes(T *doc)
 #define SUPPORTED_DC_MODES       (0x3CU)  /* 0011 1100 */
 template <typename T>
 static ChrgM_ResponseCodeType handleServiceDiscoveryRes(T *doc);
+
+#ifdef VF_USE_NX_SECURE
+static boolean serviceDiscoveryHasContractCertificateService(const struct iso2_ServiceDiscoveryResType *res)
+{
+    if ((res == NULL) || (res->ServiceList_isUsed == 0u)) {
+        return FALSE;
+    }
+
+    for (uint16_t i = 0u; i < res->ServiceList.Service.arrayLen; i++) {
+        if (res->ServiceList.Service.array[i].ServiceCategory ==
+                iso2_serviceCategoryType_ContractCertificate) {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+#endif
  
 template <>
 ChrgM_ResponseCodeType handleServiceDiscoveryRes<iso2_exiDocument>(struct iso2_exiDocument *doc)
@@ -1293,6 +1219,19 @@ ChrgM_ResponseCodeType handleServiceDiscoveryRes<iso2_exiDocument>(struct iso2_e
     /* [V2G2-490] */
     ChrgM_Status.state = PaymentServiceSelectionRes;
     ChrgM_Status.payContract = (paymentOption == iso2_paymentOptionType_Contract ? 1 : 0);
+#ifdef VF_USE_NX_SECURE
+    /* ISO 15118-2 PnC precondition:
+     * If Contract payment is selected and the EV may need CertificateInstallation
+     * or CertificateUpdate, EVSE/backend must advertise the ContractCertificate
+     * service in ServiceDiscoveryRes.ServiceList. Without that service, do not
+     * start the certificate management message pair.
+     */
+    if ((ChrgM_Status.payContract == 1u) &&
+            (serviceDiscoveryHasContractCertificateService(res) == FALSE)) {
+        handleError(CHRGM_FAILED);
+        return FAILED;
+    }
+#endif
     sendPaymentServiceSelection(&ChrgM_Status.exiDoc.iso2, res->ChargeService.ServiceID, paymentOption);
  
     return Ok;
@@ -1337,10 +1276,36 @@ static ChrgM_ResponseCodeType handleCertificateInstallationRes(T *doc);
 template <>
 ChrgM_ResponseCodeType handleCertificateInstallationRes<iso2_exiDocument>(iso2_exiDocument *doc)
 {
+    /* ISO 15118-2 CertificateInstallationRes handling.
+     * Expected payload from backend via EVSE:
+     * - SAProvisioningCertificateChain
+     * - ContractSignatureCertChain containing Contract Certificate and MO Sub-CA
+     * - ContractSignatureEncryptedPrivateKey
+     * - DHpublickey
+     * - eMAID
+     *
+     * The helper validates chains, derives AES key from ECDH/KDF, decrypts or
+     * imports the Contract Signature private key, persists material, and returns
+     * eMAID for the next PaymentDetailsReq.
+     */
     /* [V2G2-492] */
     RESPONSE_CHECK(CertificateInstallationRes);
     MHU_STOP_CHARGING();
     auto *res = &doc->V2G_Message.Body.CertificateInstallationRes;
+
+    PnC_EMAID_t emaid = {0};
+    if (PnCHlp_ProcessCertificateInstallationRes(res, &emaid) != PNC_HELPER_OK) {
+        handleError(CHRGM_FAILED);
+        return FAILED;
+    }
+    memcpy(ChrgM_Status.eMAID, emaid.characters, emaid.charactersLen);
+    ChrgM_Status.eMAIDLen = emaid.charactersLen;
+
+    ChrgM_Status.state = PaymentDetailsRes;
+    sendPaymentDetailsReq(doc);
+    return Ok;
+
+#if 0
 
     /* Step 1: Validate mandatory response payloads from ISO 15118-2 CertificateInstallationRes. */
     if (!isValidCertificateChain(&res->SAProvisioningCertificateChain) ||
@@ -1428,6 +1393,7 @@ ChrgM_ResponseCodeType handleCertificateInstallationRes<iso2_exiDocument>(iso2_e
     sendPaymentDetailsReq(doc);
     return Ok;
 
+#endif
 #if 0
  
     /* ContractSignatureEncryptedPrivateKey */
@@ -1504,11 +1470,30 @@ static ChrgM_ResponseCodeType handleCertificateUpdateRes(T *doc);
 template <>
 ChrgM_ResponseCodeType handleCertificateUpdateRes<iso2_exiDocument>(iso2_exiDocument *doc)
 {
+    /* ISO 15118-2 CertificateUpdateRes handling.
+     * Same cryptographic processing as installation, but storage must replace
+     * the current still-valid contract atomically. Optional RetryCounter should
+     * be kept with backend retry/audit state when storage support is available.
+     */
     /* [V2G2-492] */
     RESPONSE_CHECK(CertificateUpdateRes);
     MHU_STOP_CHARGING();
  
     auto *res = &doc->V2G_Message.Body.CertificateUpdateRes;
+
+    PnC_EMAID_t emaid = {0};
+    if (PnCHlp_ProcessCertificateUpdateRes(res, &emaid) != PNC_HELPER_OK) {
+        handleError(CHRGM_FAILED);
+        return FAILED;
+    }
+    memcpy(ChrgM_Status.eMAID, emaid.characters, emaid.charactersLen);
+    ChrgM_Status.eMAIDLen = emaid.charactersLen;
+
+    ChrgM_Status.state = PaymentDetailsRes;
+    sendPaymentDetailsReq(doc);
+    return Ok;
+
+#if 0
 
     /* Step 1: Validate mandatory response payloads from ISO 15118-2 CertificateUpdateRes. */
     if (!isValidCertificateChain(&res->ContractSignatureCertChain) ||
@@ -1592,6 +1577,7 @@ ChrgM_ResponseCodeType handleCertificateUpdateRes<iso2_exiDocument>(iso2_exiDocu
     sendPaymentDetailsReq(doc);
     return Ok;
 
+#endif
 #if 0
     /* ContractSignatureEncryptedPrivateKey */
     /*[V2G2-817]*/
@@ -1671,17 +1657,23 @@ static ChrgM_ResponseCodeType sendNextContractCertificateMessage(T *doc,
     switch (cert_status)
     {
     case CHRGM_NoCertificateAvailable:
-        /* No contract certificate exists yet: install a new contract certificate using OEM provisioning cert. */
+        /* No contract certificate/private key/eMAID exists: use OEM provisioning
+         * certificate and CertificateInstallation to bootstrap PnC.
+         */
         ChrgM_Status.state = CertificateInstallationRes;
         sendCertificateInstallationReq(doc);
         break;
     case CHRGM_CertificateExpired:
-        /* Expired contract certificate cannot be used for update authorization: install a new one. */
+        /* Expired contract certificate cannot be trusted for CertificateUpdate
+         * signing/authorization: install a new contract certificate.
+         */
         ChrgM_Status.state = CertificateInstallationRes;
         sendCertificateInstallationReq(doc);
         break;
     case CHRGM_CertificateExpiredSoon:
-        /* Contract certificate is still valid but near expiry: renew it before authorization/payment. */
+        /* Current contract certificate is still valid but near expiry: renew it
+         * through CertificateUpdate before continuing PnC authorization.
+         */
         ChrgM_Status.state = CertificateUpdateRes;
         sendCertificateUpdateReq(doc);
         break;
@@ -2200,7 +2192,8 @@ static void ChrgM_handleV2g(uint8* buffer, uint32_t size)
             } else {
                 if (ChrgM_Output.protocol == ISO15118_2) {
                     handleV2g(&stream, &ChrgM_Status.exiDoc.iso2);
-                } else if (ChrgM_Output.protocol == DIN70121) {
+                }
+                else if (ChrgM_Output.protocol == DIN70121) {
                     handleV2g(&stream, &ChrgM_Status.exiDoc.din);
                 }
             }
